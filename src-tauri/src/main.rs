@@ -357,8 +357,28 @@ fn setup_window_close_handler(app: &mut tauri::App) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn setup_linux_webkit_rendering_fallbacks() {
+    // WebKitGTK can abort on some Mesa/GBM setups before the window is created.
+    // Keep user-provided overrides intact, but default to safer software paths.
+    for (key, value) in [
+        ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
+        ("WEBKIT_DISABLE_COMPOSITING_MODE", "1"),
+        ("LIBGL_ALWAYS_SOFTWARE", "1"),
+    ] {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn setup_linux_webkit_rendering_fallbacks() {}
+
 #[allow(clippy::too_many_lines)] // Tauri 框架要求在 main 中注册所有命令，无法拆分
 fn main() {
+    setup_linux_webkit_rendering_fallbacks();
+
     tauri::Builder::default()
         .plugin(setup_log_plugin().build())
         .plugin(tauri_plugin_process::init())
