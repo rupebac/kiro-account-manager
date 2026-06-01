@@ -25,6 +25,20 @@ pub fn generate_random_machine_id() -> String {
     Uuid::new_v4().to_string().to_lowercase()
 }
 
+pub fn get_machine_id() -> String {
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    {
+        super::platform::get_system_machine_guid_inner()
+            .ok()
+            .and_then(|info| info.machine_guid)
+            .unwrap_or_else(generate_random_machine_id)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        generate_random_machine_id()
+    }
+}
+
 pub fn is_valid_machine_id(id: &str) -> bool {
     let lower = id.to_lowercase();
     UUID_REGEX.is_match(&lower) || HEX32_REGEX.is_match(&lower)
@@ -45,4 +59,3 @@ pub fn format_as_uuid(hex: &str) -> String {
         &c[20..32]
     )
 }
-

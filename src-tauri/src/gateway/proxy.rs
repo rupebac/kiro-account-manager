@@ -22,13 +22,15 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     core::account::{Account, AccountStore},
     commands::common::{
-        get_usage_by_provider, is_token_expiring_soon,
-        refresh_token_by_provider, resolve_default_profile_arn, update_account_status, RefreshResult,
+        get_usage_by_provider_for_account, is_token_expiring_soon,
+        refresh_token_by_provider_with_account_proxy, resolve_default_profile_arn,
+        update_account_status, RefreshResult,
     },
     commands::machine_guid::get_machine_id,
     clients::{
         http_client::{
             build_kiro_custom_user_agent, build_q_service_url,
+            build_streaming_http_client_for_account,
             resolve_kiro_upstream_region, should_add_redirect_for_internal,
             should_send_codewhisperer_optout,
         },
@@ -74,6 +76,7 @@ struct UpstreamCredentials {
     #[allow(dead_code)]
     auth_method: Option<String>,
     send_opt_out: bool,
+    http: Client,
 }
 
 async fn restore_responses_session_messages(
@@ -289,7 +292,7 @@ fn build_health_response() -> Value {
 async fn get_available_models_for_upstream(
     upstream: &UpstreamCredentials,
 ) -> Result<Vec<String>, String> {
-    let client = KiroQClient::new()?;
+    let client = KiroQClient::from_client(upstream.http.clone());
 
     let response = client
         .list_available_models(
@@ -1448,7 +1451,7 @@ pub async fn proxy_handler(
     };
 
     let upstream_payload = match build_kiro_payload(
-        &state.http,
+        &upstream.http,
         &request,
         upstream.profile_arn.clone(),
         available_models.as_deref(),
@@ -1647,7 +1650,7 @@ pub async fn proxy_handler(
         };
         
         // 发送请求
-        match send_generate_request(&state.http, &current_upstream, &payload_value, upstream_payload_log_context.request_index as usize).await {
+        match send_generate_request(&current_upstream, &payload_value, upstream_payload_log_context.request_index as usize).await {
             Ok(resp) => break resp,
             Err((status, error_type, message, upstream_response_body)) => {
                 // 检查是否是 429 错误
@@ -1962,7 +1965,6 @@ pub async fn proxy_handler(
 }
 
 async fn send_generate_request<T: serde::Serialize + ?Sized>(
-    http: &Client,
     upstream: &UpstreamCredentials,
     upstream_payload: &T,
     request_index: usize,
@@ -1994,7 +1996,7 @@ async fn send_generate_request<T: serde::Serialize + ?Sized>(
         attempt += 1;
 
         let upstream_resp = with_kiro_upstream_headers(
-            http.post(&upstream_url),
+            upstream.http.post(&upstream_url),
             upstream,
             "application/vnd.amazon.eventstream",
             true,
@@ -2291,6 +2293,7 @@ async fn resolve_managed_account_credentials(
                     &account,
                     &state.config.region,
                 );
+                let http = build_streaming_http_client_for_account(&account)?;
                 return Ok(UpstreamCredentials {
                     access_token: access_token.clone(),
                     profile_arn: ctx.profile_arn,
@@ -2300,15 +2303,21 @@ async fn resolve_managed_account_credentials(
                     user_agent: build_kiro_custom_user_agent(&ctx.machine_id),
                     auth_method: account.auth_method.clone(),
                     send_opt_out: should_send_codewhisperer_optout(),
+                    http,
                 });
             }
         }
     }
 
-    match refresh_token_by_provider(&account).await {
+    match refresh_token_by_provider_with_account_proxy(&account).await {
         Ok(refresh) => {
             let provider = account.provider.as_deref().unwrap_or("Google").to_string();
-            let usage_result = get_usage_by_provider(&provider, &refresh.access_token).await;
+            let usage_result = get_usage_by_provider_for_account(
+                &account,
+                &provider,
+                &refresh.access_token,
+            )
+            .await;
             let mut usage_data = None;
             let mut is_banned = false;
             let mut is_auth_error = false;
@@ -2371,6 +2380,7 @@ async fn resolve_managed_account_credentials(
                 account.region.as_deref(),
                 &config.region,
             );
+            let http = build_streaming_http_client_for_account(&account)?;
 
             Ok(UpstreamCredentials {
                 access_token: refresh.access_token,
@@ -2381,6 +2391,7 @@ async fn resolve_managed_account_credentials(
                 user_agent: build_kiro_custom_user_agent(&machine_id),
                 auth_method: account.auth_method.clone(),
                 send_opt_out: should_send_codewhisperer_optout(),
+                http,
             })
         }
         Err(error) => {
