@@ -4,7 +4,6 @@ use crate::core::account::Account;
 use crate::auth::providers::{
     AuthProvider, IdcProvider, RefreshMetadata, SocialProvider,
 };
-use crate::commands::machine_guid::generate_random_machine_id;
 use crate::utils::client_id_hash::calculate_client_id_hash;
 use std::sync::{Mutex, MutexGuard};
 
@@ -129,27 +128,6 @@ pub fn resolve_default_profile_arn(provider: Option<&str>) -> &'static str {
     }
 }
 
-/// Generate an account-scoped machine ID.
-///
-/// This deliberately does not read the system machine GUID: stored accounts must
-/// have stable IDs without linking multiple accounts on the same host.
-pub fn generate_account_machine_id() -> String {
-    generate_random_machine_id()
-}
-
-pub fn account_machine_id_or_new(machine_id: &Option<String>) -> String {
-    machine_id
-        .clone()
-        .filter(|id| !id.trim().is_empty())
-        .unwrap_or_else(generate_account_machine_id)
-}
-
-pub fn ensure_account_machine_id(account: &mut Account) -> String {
-    let machine_id = account_machine_id_or_new(&account.machine_id);
-    account.machine_id = Some(machine_id.clone());
-    machine_id
-}
-
 // ===== Mutex 锁辅助 =====
 
 /// 锁定 AppState 中任意 `Mutex<T>`，统一错误信息
@@ -181,7 +159,7 @@ pub fn find_account_by_id(
 /// 调用 Kiro Q API 需要的三件套：machine_id / region / profile_arn
 ///
 /// 解析规则：
-/// - machine_id：账号自带（非空）→ 否则生成账号独立 ID
+/// - machine_id：账号自带（非空）→ 否则系统 machine_guid
 /// - profile_arn：Enterprise → None；其他账号自带 → 否则 provider 默认 ARN
 /// - region：profile_arn 解析出来的 region 优先 → 账号 region → fallback
 pub struct KiroCallContext {
@@ -192,8 +170,13 @@ pub struct KiroCallContext {
 
 pub fn resolve_kiro_call_context(account: &Account, fallback_region: &str) -> KiroCallContext {
     use crate::clients::http_client::resolve_kiro_upstream_region;
+    use crate::commands::machine_guid::get_machine_id;
 
-    let machine_id = account_machine_id_or_new(&account.machine_id);
+    let machine_id = account
+        .machine_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(get_machine_id);
 
     let profile_arn = match account.provider.as_deref() {
         Some("Enterprise") => None,
@@ -343,8 +326,10 @@ pub struct UsageResult {
     pub is_auth_error: bool,
 }
 
-/// 根据 provider 刷新 token
-pub async fn refresh_token_by_provider(account: &Account) -> Result<RefreshResult, String> {
+async fn refresh_token_by_provider_inner(
+    account: &Account,
+    use_account_proxy: bool,
+) -> Result<RefreshResult, String> {
     let provider = account.provider.as_deref().unwrap_or("Google");
     let refresh_token = account.refresh_token.as_ref().ok_or("No refresh token")?;
 
@@ -353,6 +338,7 @@ pub async fn refresh_token_by_provider(account: &Account) -> Result<RefreshResul
             client_id: account.client_id.clone(),
             client_secret: account.client_secret.clone(),
             region: account.region.clone(),
+            account: use_account_proxy.then(|| account.clone()),
             ..Default::default()
         };
         let region = metadata.region.as_deref().unwrap_or("us-east-1");
@@ -375,7 +361,8 @@ pub async fn refresh_token_by_provider(account: &Account) -> Result<RefreshResul
     } else {
         let metadata = RefreshMetadata {
             profile_arn: account.profile_arn.clone(),
-            machine_id: Some(account_machine_id_or_new(&account.machine_id)),
+            machine_id: account.machine_id.clone(),
+            account: use_account_proxy.then(|| account.clone()),
             ..Default::default()
         };
         let social_provider = SocialProvider::new(provider);
@@ -393,15 +380,47 @@ pub async fn refresh_token_by_provider(account: &Account) -> Result<RefreshResul
     }
 }
 
+/// 根据 provider 刷新 token（普通账号管理路径，沿用通用代理配置）
+pub async fn refresh_token_by_provider(account: &Account) -> Result<RefreshResult, String> {
+    refresh_token_by_provider_inner(account, false).await
+}
+
+/// 根据 provider 刷新 token（Reverse Proxy 路径，使用账号级代理）
+pub async fn refresh_token_by_provider_with_account_proxy(
+    account: &Account,
+) -> Result<RefreshResult, String> {
+    refresh_token_by_provider_inner(account, true).await
+}
+
 /// 统一使用 getUsageLimits 接口获取 usage 数据（支持所有账号类型）
 pub async fn get_usage_by_account(
     account: &crate::core::account::Account,
     access_token: &str,
 ) -> Result<UsageResult, String> {
+    get_usage_by_account_inner(account, access_token, false).await
+}
+
+pub async fn get_usage_by_account_with_account_proxy(
+    account: &crate::core::account::Account,
+    access_token: &str,
+) -> Result<UsageResult, String> {
+    get_usage_by_account_inner(account, access_token, true).await
+}
+
+async fn get_usage_by_account_inner(
+    account: &crate::core::account::Account,
+    access_token: &str,
+    use_account_proxy: bool,
+) -> Result<UsageResult, String> {
     use crate::clients::http_client::resolve_kiro_upstream_region;
     use crate::clients::kiro_q_client::KiroQClient;
+    use crate::commands::machine_guid::get_machine_id;
 
-    let machine_id = account_machine_id_or_new(&account.machine_id);
+    let machine_id = account
+        .machine_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(get_machine_id);
 
     let region = resolve_kiro_upstream_region(
         account.profile_arn.as_deref(),
@@ -433,7 +452,11 @@ pub async fn get_usage_by_account(
         _ => account.profile_arn.as_deref(),
     };
 
-    let client = KiroQClient::new()?;
+    let client = if use_account_proxy {
+        KiroQClient::for_account(account)?
+    } else {
+        KiroQClient::new()?
+    };
     let usage_call = client
         .get_usage_limits(
             access_token,
@@ -479,22 +502,15 @@ pub async fn get_usage_by_provider(
     provider: &str,
     access_token: &str,
 ) -> Result<UsageResult, String> {
-    let machine_id = generate_account_machine_id();
-    get_usage_by_provider_with_machine_id(provider, access_token, &machine_id).await
-}
+    use crate::commands::machine_guid::get_machine_id;
 
-pub async fn get_usage_by_provider_with_machine_id(
-    provider: &str,
-    access_token: &str,
-    machine_id: &str,
-) -> Result<UsageResult, String> {
     // 为了兼容旧调用，创建一个临时账号对象
     let mut temp_account = crate::core::account::Account::new(
         String::new(),
         String::new(),
     );
     temp_account.provider = Some(provider.to_string());
-    temp_account.machine_id = Some(machine_id.to_string());
+    temp_account.machine_id = Some(get_machine_id());
 
     // 根据 provider 设置 auth_method（profile_arn 由 get_usage_by_account 统一处理）
     if provider == "BuilderId" || provider == "Enterprise" {
@@ -506,15 +522,40 @@ pub async fn get_usage_by_provider_with_machine_id(
     get_usage_by_account(&temp_account, access_token).await
 }
 
+pub async fn get_usage_by_provider_for_account(
+    account: &crate::core::account::Account,
+    provider: &str,
+    access_token: &str,
+) -> Result<UsageResult, String> {
+    let mut temp_account = account.clone();
+    temp_account.provider = Some(provider.to_string());
+    if temp_account
+        .machine_id
+        .as_deref()
+        .map_or(true, |value| value.trim().is_empty())
+    {
+        temp_account.machine_id = Some(crate::commands::machine_guid::get_machine_id());
+    }
+
+    if provider == "BuilderId" || provider == "Enterprise" {
+        temp_account.auth_method = Some("IdC".to_string());
+    } else {
+        temp_account.auth_method = Some("social".to_string());
+    }
+
+    get_usage_by_account_with_account_proxy(&temp_account, access_token).await
+}
+
 /// 为企业账号获取 usage 数据（多区域探测）
 /// 返回 (UsageResult, detected_region)
-pub async fn get_enterprise_usage_with_region_probe(
+pub async fn get_enterprise_usage_with_region_probe_for_account(
+    account: &crate::core::account::Account,
     access_token: &str,
     machine_id: &str,
 ) -> Result<(UsageResult, String), String> {
     use crate::clients::kiro_q_client::KiroQClient;
 
-    let client = KiroQClient::new()?;
+    let client = KiroQClient::for_account(account)?;
     let result = client
         .get_usage_limits_with_region_probe(access_token, machine_id)
         .await;
@@ -546,6 +587,19 @@ pub async fn get_enterprise_usage_with_region_probe(
         )),
         Err(e) => Err(e),
     }
+}
+
+pub async fn get_enterprise_usage_with_region_probe(
+    access_token: &str,
+    machine_id: &str,
+) -> Result<(UsageResult, String), String> {
+    let mut temp_account = crate::core::account::Account::new(String::new(), String::new());
+    temp_account.provider = Some("Enterprise".to_string());
+    temp_account.auth_method = Some("IdC".to_string());
+    temp_account.machine_id = Some(machine_id.to_string());
+
+    get_enterprise_usage_with_region_probe_for_account(&temp_account, access_token, machine_id)
+        .await
 }
 
 /// 解析 usage 结果，提取封禁状态和认证错误

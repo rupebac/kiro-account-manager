@@ -1,8 +1,8 @@
 use crate::core::account::{Account, AvailableModelsCacheEntry};
 use crate::commands::common::account_machine_id_or_new;
 use crate::clients::http_client::{
-    build_http_client_with_user_agent, build_kiro_custom_user_agent,
-    build_q_service_url, resolve_kiro_upstream_region,
+    build_http_client_with_user_agent, build_kiro_custom_user_agent, build_q_service_url,
+    resolve_kiro_upstream_region,
 };
 use serde::{Deserialize, Serialize};
 

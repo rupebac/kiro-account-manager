@@ -22,11 +22,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     core::account::{Account, AccountStore},
     commands::common::{
-        account_machine_id_or_new, get_usage_by_account, is_token_expiring_soon,
-        refresh_token_by_provider, resolve_default_profile_arn, update_account_status, RefreshResult,
+        is_token_expiring_soon, refresh_token_by_provider_with_account_proxy,
+        resolve_default_profile_arn, update_account_status, RefreshResult,
     },
+    commands::machine_guid::get_machine_id,
     clients::{
         http_client::{
+            build_streaming_http_client_for_account,
             build_kiro_custom_user_agent, build_q_service_url,
             resolve_kiro_upstream_region, should_add_redirect_for_internal,
             should_send_codewhisperer_optout,
@@ -69,11 +71,11 @@ struct UpstreamCredentials {
     provider: Option<String>,
     region: String,
     source_label: String,
-    machine_id: String,
     user_agent: String,
     #[allow(dead_code)]
     auth_method: Option<String>,
     send_opt_out: bool,
+    http: Client,
 }
 
 async fn restore_responses_session_messages(
@@ -289,12 +291,12 @@ fn build_health_response() -> Value {
 async fn get_available_models_for_upstream(
     upstream: &UpstreamCredentials,
 ) -> Result<Vec<String>, String> {
-    let client = KiroQClient::new()?;
+    let client = KiroQClient::from_client(upstream.http.clone());
 
     let response = client
         .list_available_models(
             &upstream.access_token,
-            &upstream.machine_id,
+            &get_machine_id(),
             &upstream.region,
             upstream.profile_arn.as_deref(),
             None, // model_provider
@@ -1387,7 +1389,7 @@ pub async fn proxy_handler(
     };
 
     let upstream_payload = match build_kiro_payload(
-        &state.http,
+        &upstream.http,
         &request,
         upstream.profile_arn.clone(),
         available_models.as_deref(),
@@ -1586,7 +1588,7 @@ pub async fn proxy_handler(
         };
         
         // 发送请求
-        match send_generate_request(&state.http, &current_upstream, &payload_value, upstream_payload_log_context.request_index as usize).await {
+        match send_generate_request(&current_upstream, &payload_value, upstream_payload_log_context.request_index as usize).await {
             Ok(resp) => break resp,
             Err((status, error_type, message, upstream_response_body)) => {
                 // 检查是否是 429 错误
@@ -1901,7 +1903,6 @@ pub async fn proxy_handler(
 }
 
 async fn send_generate_request<T: serde::Serialize + ?Sized>(
-    http: &Client,
     upstream: &UpstreamCredentials,
     upstream_payload: &T,
     request_index: usize,
@@ -1933,7 +1934,7 @@ async fn send_generate_request<T: serde::Serialize + ?Sized>(
         attempt += 1;
 
         let upstream_resp = with_kiro_upstream_headers(
-            http.post(&upstream_url),
+            upstream.http.post(&upstream_url),
             upstream,
             "application/vnd.amazon.eventstream",
             true,
@@ -2230,24 +2231,31 @@ async fn resolve_managed_account_credentials(
                     &account,
                     &state.config.region,
                 );
+                let http = build_streaming_http_client_for_account(&account)?;
                 return Ok(UpstreamCredentials {
                     access_token: access_token.clone(),
                     profile_arn: ctx.profile_arn,
                     provider: account.provider.clone(),
                     region: ctx.region,
                     source_label: format_managed_upstream_source(&state.config, &account),
-                    machine_id: ctx.machine_id.clone(),
                     user_agent: build_kiro_custom_user_agent(&ctx.machine_id),
                     auth_method: account.auth_method.clone(),
                     send_opt_out: should_send_codewhisperer_optout(),
+                    http,
                 });
             }
         }
     }
 
-    match refresh_token_by_provider(&account).await {
+    match refresh_token_by_provider_with_account_proxy(&account).await {
         Ok(refresh) => {
-            let usage_result = get_usage_by_account(&account, &refresh.access_token).await;
+            let provider = account.provider.as_deref().unwrap_or("Google").to_string();
+            let usage_result = crate::commands::common::get_usage_by_provider_for_account(
+                &account,
+                &provider,
+                &refresh.access_token,
+            )
+            .await;
             let mut usage_data = None;
             let mut is_banned = false;
             let mut is_auth_error = false;
@@ -2295,7 +2303,11 @@ async fn resolve_managed_account_credentials(
             let response_time_ms = request_start.elapsed().as_millis() as u64;
             state.load_balancer.record_success(&account.id, response_time_ms).await;
 
-            let machine_id = account_machine_id_or_new(&account.machine_id);
+            let machine_id = account
+                .machine_id
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(get_machine_id);
             let profile_arn = match account.provider.as_deref() {
                 Some("Enterprise") => None,
                 provider => refresh.profile_arn.or_else(|| account.profile_arn.clone())
@@ -2306,6 +2318,7 @@ async fn resolve_managed_account_credentials(
                 account.region.as_deref(),
                 &config.region,
             );
+            let http = build_streaming_http_client_for_account(&account)?;
 
             Ok(UpstreamCredentials {
                 access_token: refresh.access_token,
@@ -2313,10 +2326,10 @@ async fn resolve_managed_account_credentials(
                 provider: account.provider.clone(),
                 region,
                 source_label: format_managed_upstream_source(config, &account),
-                machine_id: machine_id.clone(),
                 user_agent: build_kiro_custom_user_agent(&machine_id),
                 auth_method: account.auth_method.clone(),
                 send_opt_out: should_send_codewhisperer_optout(),
+                http,
             })
         }
         Err(error) => {
@@ -4366,7 +4379,6 @@ mod tests {
             },
             request_count: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(AsyncMutex::new(None)),
-            http: Client::new(),
             responses_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
             token_cache: Arc::new(AsyncMutex::new(TokenCache::new())),
             load_balancer: Arc::new(crate::gateway::load_balancer::LoadBalancer::new(
@@ -5096,10 +5108,10 @@ mod tests {
             provider: None,
             region: "us-east-1".to_string(),
             source_label: "single:test".to_string(),
-            machine_id: "machine-123".to_string(),
             user_agent: "KiroIDE 0.11.34 machine-123".to_string(),
             auth_method: Some("external_idp".to_string()),
             send_opt_out: true,
+            http: reqwest::Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5163,10 +5175,10 @@ mod tests {
             provider: None,
             region: "us-east-1".to_string(),
             source_label: "single:test".to_string(),
-            machine_id: "machine-456".to_string(),
             user_agent: "KiroIDE 0.11.34 machine-456".to_string(),
             auth_method: Some("social".to_string()),
             send_opt_out: true,
+            http: reqwest::Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5208,10 +5220,10 @@ mod tests {
             provider: None,
             region: "us-east-1".to_string(),
             source_label: "single:test".to_string(),
-            machine_id: "machine-789".to_string(),
             user_agent: "KiroIDE 0.11.34 machine-789".to_string(),
             auth_method: Some("social".to_string()),
             send_opt_out: true,
+            http: reqwest::Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5243,10 +5255,10 @@ mod tests {
             provider: Some("Internal".to_string()),
             region: "us-east-1".to_string(),
             source_label: "single:test".to_string(),
-            machine_id: "machine-999".to_string(),
             user_agent: "KiroIDE 0.11.34 machine-999".to_string(),
             auth_method: Some("IdC".to_string()),
             send_opt_out: true,
+            http: reqwest::Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5279,10 +5291,10 @@ mod tests {
                 provider: Some(provider.to_string()),
                 region: "us-east-1".to_string(),
                 source_label: "single:test".to_string(),
-                machine_id: "machine-1000".to_string(),
                 user_agent: "KiroIDE 0.11.34 machine-1000".to_string(),
                 auth_method: Some("IdC".to_string()),
                 send_opt_out: true,
+                http: reqwest::Client::new(),
             };
 
             let request = with_kiro_upstream_headers(
