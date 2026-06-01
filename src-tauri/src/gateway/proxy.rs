@@ -4441,7 +4441,6 @@ mod tests {
             },
             request_count: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(AsyncMutex::new(None)),
-            http: Client::new(),
             responses_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
             token_cache: Arc::new(AsyncMutex::new(TokenCache::new())),
             load_balancer: Arc::new(crate::gateway::load_balancer::LoadBalancer::new(
@@ -5301,6 +5300,7 @@ mod tests {
             user_agent: "KiroIDE 0.11.34 machine-123".to_string(),
             auth_method: Some("external_idp".to_string()),
             send_opt_out: true,
+            http: Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5367,6 +5367,7 @@ mod tests {
             user_agent: "KiroIDE 0.11.34 machine-456".to_string(),
             auth_method: Some("social".to_string()),
             send_opt_out: true,
+            http: Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5411,6 +5412,7 @@ mod tests {
             user_agent: "KiroIDE 0.11.34 machine-789".to_string(),
             auth_method: Some("social".to_string()),
             send_opt_out: true,
+            http: Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5445,6 +5447,7 @@ mod tests {
             user_agent: "KiroIDE 0.11.34 machine-999".to_string(),
             auth_method: Some("IdC".to_string()),
             send_opt_out: true,
+            http: Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5480,6 +5483,7 @@ mod tests {
                 user_agent: "KiroIDE 0.11.34 machine-1000".to_string(),
                 auth_method: Some("IdC".to_string()),
                 send_opt_out: true,
+                http: Client::new(),
             };
 
             let request = with_kiro_upstream_headers(

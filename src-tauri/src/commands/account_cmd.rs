@@ -140,8 +140,7 @@ pub async fn sync_account(
     // 如果账号缺少 machine_id，自动生成一个（所有账号都需要）
     let mut account = account.clone();
     if account.machine_id.is_none() {
-        use crate::commands::machine_guid::get_machine_id;
-        let machine_id = get_machine_id();
+        let machine_id = crate::commands::common::generate_account_machine_id();
         account.machine_id = Some(machine_id);
         log::info!("Generated machine_id for account: {}", account.id);
     }
