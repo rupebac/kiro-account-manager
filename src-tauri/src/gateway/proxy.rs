@@ -22,13 +22,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     core::account::{Account, AccountStore},
     commands::common::{
-        is_token_expiring_soon, refresh_token_by_provider_with_account_proxy,
-        resolve_default_profile_arn, update_account_status, RefreshResult,
+        get_usage_by_provider, is_token_expiring_soon,
+        refresh_token_by_provider, resolve_default_profile_arn, update_account_status, RefreshResult,
     },
     commands::machine_guid::get_machine_id,
     clients::{
         http_client::{
-            build_streaming_http_client_for_account,
             build_kiro_custom_user_agent, build_q_service_url,
             resolve_kiro_upstream_region, should_add_redirect_for_internal,
             should_send_codewhisperer_optout,
@@ -75,7 +74,6 @@ struct UpstreamCredentials {
     #[allow(dead_code)]
     auth_method: Option<String>,
     send_opt_out: bool,
-    http: Client,
 }
 
 async fn restore_responses_session_messages(
@@ -291,7 +289,7 @@ fn build_health_response() -> Value {
 async fn get_available_models_for_upstream(
     upstream: &UpstreamCredentials,
 ) -> Result<Vec<String>, String> {
-    let client = KiroQClient::from_client(upstream.http.clone());
+    let client = KiroQClient::new()?;
 
     let response = client
         .list_available_models(
@@ -669,10 +667,69 @@ async fn get_model_max_input_tokens(model_id: &str) -> usize {
     }
 }
 
+fn cleanup_orphaned_tool_results(history: &mut [Value]) {
+    let tool_use_ids: HashSet<String> = history
+        .iter()
+        .filter_map(|msg| msg.get("assistantResponseMessage"))
+        .filter_map(|msg| msg.get("toolUses"))
+        .filter_map(|tools| tools.as_array())
+        .flat_map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("toolUseId").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    for msg in history.iter_mut() {
+        let Some(user_msg) = msg
+            .get_mut("userInputMessage")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+
+        let mut removed_all_results = false;
+        if let Some(ctx) = user_msg
+            .get_mut("userInputMessageContext")
+            .and_then(Value::as_object_mut)
+        {
+            if let Some(results) = ctx.get_mut("toolResults").and_then(Value::as_array_mut) {
+                let before = results.len();
+                results.retain(|result| {
+                    result
+                        .get("toolUseId")
+                        .and_then(Value::as_str)
+                        .map(|tool_use_id| tool_use_ids.contains(tool_use_id))
+                        .unwrap_or(true)
+                });
+                removed_all_results = before > 0 && results.is_empty();
+                if results.is_empty() {
+                    ctx.remove("toolResults");
+                }
+            }
+
+            if ctx.is_empty() {
+                user_msg.remove("userInputMessageContext");
+            }
+        }
+
+        let has_content = user_msg
+            .get("content")
+            .and_then(Value::as_str)
+            .map(|content| !content.trim().is_empty())
+            .unwrap_or(false);
+        if removed_all_results && !has_content {
+            user_msg.insert("content".to_string(), Value::String("Continue".to_string()));
+        }
+    }
+}
+
 /// 智能裁剪 Kiro payload 历史记录
 ///
 /// 策略：
-/// 1. 识别 tool call/result 配对（Assistant with tool_uses + User with tool_results）
+/// 1. 识别 tool call/result 配对（Assistant with toolUses + User with toolResults）
 /// 2. 从最旧的完整对话单元开始删除
 /// 3. 保留最近的对话（至少保留最后 2 条消息）
 /// 4. 避免破坏 tool_calls 和 tool_results 的配对关系
@@ -714,22 +771,22 @@ fn trim_kiro_payload_history(payload: &mut Value, max_bytes: usize) -> bool {
             break;
         }
 
-        // 检查第一条消息是否是 Assistant 消息且包含 tool_uses
+        // 检查第一条消息是否是 Assistant 消息且包含 toolUses
         let first_is_assistant_with_tools = history
             .first()
-            .and_then(|msg| msg.get("assistant_response_message"))
-            .and_then(|msg| msg.get("tool_uses"))
+            .and_then(|msg| msg.get("assistantResponseMessage"))
+            .and_then(|msg| msg.get("toolUses"))
             .and_then(|tools| tools.as_array())
             .map(|arr| !arr.is_empty())
             .unwrap_or(false);
 
         if first_is_assistant_with_tools && history.len() > 1 {
-            // 检查第二条消息是否是 User 消息且包含 tool_results
+            // 检查第二条消息是否是 User 消息且包含 toolResults
             let second_has_tool_results = history
                 .get(1)
-                .and_then(|msg| msg.get("user_input_message"))
-                .and_then(|msg| msg.get("user_input_message_context"))
-                .and_then(|ctx| ctx.get("tool_results"))
+                .and_then(|msg| msg.get("userInputMessage"))
+                .and_then(|msg| msg.get("userInputMessageContext"))
+                .and_then(|ctx| ctx.get("toolResults"))
                 .and_then(|results| results.as_array())
                 .map(|arr| !arr.is_empty())
                 .unwrap_or(false);
@@ -741,6 +798,7 @@ fn trim_kiro_payload_history(payload: &mut Value, max_bytes: usize) -> bool {
                     history.remove(0);
                     history.remove(0); // 删除第二条（现在变成第一条了）
                     removed_count += 2;
+                    cleanup_orphaned_tool_results(history);
                     log::debug!("[网关] 移除工具调用/结果对。剩余: {}", history.len());
                     continue;
                 } else {
@@ -753,6 +811,7 @@ fn trim_kiro_payload_history(payload: &mut Value, max_bytes: usize) -> bool {
         // 单个消息可以安全删除
         history.remove(0);
         removed_count += 1;
+        cleanup_orphaned_tool_results(history);
         log::debug!("[网关] 移除单条消息。剩余: {}", history.len());
     }
 
@@ -1389,7 +1448,7 @@ pub async fn proxy_handler(
     };
 
     let upstream_payload = match build_kiro_payload(
-        &upstream.http,
+        &state.http,
         &request,
         upstream.profile_arn.clone(),
         available_models.as_deref(),
@@ -1588,7 +1647,7 @@ pub async fn proxy_handler(
         };
         
         // 发送请求
-        match send_generate_request(&current_upstream, &payload_value, upstream_payload_log_context.request_index as usize).await {
+        match send_generate_request(&state.http, &current_upstream, &payload_value, upstream_payload_log_context.request_index as usize).await {
             Ok(resp) => break resp,
             Err((status, error_type, message, upstream_response_body)) => {
                 // 检查是否是 429 错误
@@ -1903,6 +1962,7 @@ pub async fn proxy_handler(
 }
 
 async fn send_generate_request<T: serde::Serialize + ?Sized>(
+    http: &Client,
     upstream: &UpstreamCredentials,
     upstream_payload: &T,
     request_index: usize,
@@ -1934,7 +1994,7 @@ async fn send_generate_request<T: serde::Serialize + ?Sized>(
         attempt += 1;
 
         let upstream_resp = with_kiro_upstream_headers(
-            upstream.http.post(&upstream_url),
+            http.post(&upstream_url),
             upstream,
             "application/vnd.amazon.eventstream",
             true,
@@ -2231,7 +2291,6 @@ async fn resolve_managed_account_credentials(
                     &account,
                     &state.config.region,
                 );
-                let http = build_streaming_http_client_for_account(&account)?;
                 return Ok(UpstreamCredentials {
                     access_token: access_token.clone(),
                     profile_arn: ctx.profile_arn,
@@ -2241,21 +2300,15 @@ async fn resolve_managed_account_credentials(
                     user_agent: build_kiro_custom_user_agent(&ctx.machine_id),
                     auth_method: account.auth_method.clone(),
                     send_opt_out: should_send_codewhisperer_optout(),
-                    http,
                 });
             }
         }
     }
 
-    match refresh_token_by_provider_with_account_proxy(&account).await {
+    match refresh_token_by_provider(&account).await {
         Ok(refresh) => {
             let provider = account.provider.as_deref().unwrap_or("Google").to_string();
-            let usage_result = crate::commands::common::get_usage_by_provider_for_account(
-                &account,
-                &provider,
-                &refresh.access_token,
-            )
-            .await;
+            let usage_result = get_usage_by_provider(&provider, &refresh.access_token).await;
             let mut usage_data = None;
             let mut is_banned = false;
             let mut is_auth_error = false;
@@ -2318,7 +2371,6 @@ async fn resolve_managed_account_credentials(
                 account.region.as_deref(),
                 &config.region,
             );
-            let http = build_streaming_http_client_for_account(&account)?;
 
             Ok(UpstreamCredentials {
                 access_token: refresh.access_token,
@@ -2329,7 +2381,6 @@ async fn resolve_managed_account_credentials(
                 user_agent: build_kiro_custom_user_agent(&machine_id),
                 auth_method: account.auth_method.clone(),
                 send_opt_out: should_send_codewhisperer_optout(),
-                http,
             })
         }
         Err(error) => {
@@ -4379,6 +4430,7 @@ mod tests {
             },
             request_count: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(AsyncMutex::new(None)),
+            http: Client::new(),
             responses_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
             token_cache: Arc::new(AsyncMutex::new(TokenCache::new())),
             load_balancer: Arc::new(crate::gateway::load_balancer::LoadBalancer::new(
@@ -4659,33 +4711,69 @@ mod tests {
         assert!(size > 0);
     }
 
+    fn assert_no_orphaned_tool_results(history: &[Value]) {
+        let tool_use_ids: HashSet<String> = history
+            .iter()
+            .filter_map(|msg| msg.get("assistantResponseMessage"))
+            .filter_map(|msg| msg.get("toolUses"))
+            .filter_map(|tools| tools.as_array())
+            .flat_map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool.get("toolUseId").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for msg in history {
+            let Some(results) = msg
+                .get("userInputMessage")
+                .and_then(|msg| msg.get("userInputMessageContext"))
+                .and_then(|ctx| ctx.get("toolResults"))
+                .and_then(|results| results.as_array())
+            else {
+                continue;
+            };
+
+            for result in results {
+                let tool_use_id = result
+                    .get("toolUseId")
+                    .and_then(Value::as_str)
+                    .expect("toolResult must include toolUseId");
+                assert!(
+                    tool_use_ids.contains(tool_use_id),
+                    "orphaned toolResult left after trim: {tool_use_id}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_trim_kiro_payload_history_removes_oldest_messages() {
         let mut payload = json!({
             "conversationState": {
                 "history": [
                     {
-                        "user_input_message": {
-                            "user_input_message_context": {
-                                "text": "First message"
-                            }
+                        "userInputMessage": {
+                            "content": "First message",
+                            "userInputMessageContext": {}
                         }
                     },
                     {
-                        "assistant_response_message": {
-                            "text": "First response"
+                        "assistantResponseMessage": {
+                            "content": "First response"
                         }
                     },
                     {
-                        "user_input_message": {
-                            "user_input_message_context": {
-                                "text": "Second message"
-                            }
+                        "userInputMessage": {
+                            "content": "Second message",
+                            "userInputMessageContext": {}
                         }
                     },
                     {
-                        "assistant_response_message": {
-                            "text": "Second response"
+                        "assistantResponseMessage": {
+                            "content": "Second response"
                         }
                     }
                 ]
@@ -4710,11 +4798,11 @@ mod tests {
             "conversationState": {
                 "history": [
                     {
-                        "assistant_response_message": {
-                            "text": "Let me search for that",
-                            "tool_uses": [
+                        "assistantResponseMessage": {
+                            "content": "Let me search for that",
+                            "toolUses": [
                                 {
-                                    "id": "call_1",
+                                    "toolUseId": "call_1",
                                     "name": "search",
                                     "input": {"q": "test"}
                                 }
@@ -4722,41 +4810,132 @@ mod tests {
                         }
                     },
                     {
-                        "user_input_message": {
-                            "user_input_message_context": {
-                                "tool_results": [
+                        "userInputMessage": {
+                            "content": "",
+                            "userInputMessageContext": {
+                                "toolResults": [
                                     {
-                                        "call_id": "call_1",
-                                        "output": "Found results"
+                                        "toolUseId": "call_1",
+                                        "content": [{"text": "Found results"}],
+                                        "status": "success"
                                     }
                                 ]
                             }
                         }
                     },
                     {
-                        "user_input_message": {
-                            "user_input_message_context": {
-                                "text": "Recent message"
-                            }
+                        "assistantResponseMessage": {
+                            "content": "Recent response"
+                        }
+                    },
+                    {
+                        "userInputMessage": {
+                            "content": "Recent message",
+                            "userInputMessageContext": {}
                         }
                     }
                 ]
             }
         });
 
-        let max_bytes = 200;
+        // Reproduce the old bug: with snake_case key checks, trim removed only the
+        // assistant toolUse message and then stopped, leaving an orphan toolResult.
+        let mut assistant_only_trimmed = payload.clone();
+        assistant_only_trimmed
+            .pointer_mut("/conversationState/history")
+            .and_then(Value::as_array_mut)
+            .unwrap()
+            .remove(0);
+        let max_bytes = check_payload_size(&assistant_only_trimmed);
+
         let trimmed = trim_kiro_payload_history(&mut payload, max_bytes);
 
-        if trimmed {
-            let history = payload
-                .pointer("/conversationState/history")
-                .and_then(|v| v.as_array())
-                .unwrap();
+        assert!(trimmed);
+        let history = payload
+            .pointer("/conversationState/history")
+            .and_then(Value::as_array)
+            .unwrap();
 
-            if history.len() == 1 {
-                assert!(history[0].get("user_input_message").is_some());
+        assert_eq!(history.len(), 2);
+        assert!(history[0].get("assistantResponseMessage").is_some());
+        assert!(history[1].get("userInputMessage").is_some());
+        assert_no_orphaned_tool_results(history);
+    }
+
+    #[test]
+    fn test_trim_kiro_payload_history_cleans_non_adjacent_orphaned_tool_results() {
+        let mut payload = json!({
+            "conversationState": {
+                "history": [
+                    {
+                        "assistantResponseMessage": {
+                            "content": "Let me search for that",
+                            "toolUses": [
+                                {
+                                    "toolUseId": "call_1",
+                                    "name": "search",
+                                    "input": {"q": "test"}
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "userInputMessage": {
+                            "content": "Intermediate user message",
+                            "userInputMessageContext": {}
+                        }
+                    },
+                    {
+                        "userInputMessage": {
+                            "content": "",
+                            "userInputMessageContext": {
+                                "toolResults": [
+                                    {
+                                        "toolUseId": "call_1",
+                                        "content": [{"text": "Found results"}],
+                                        "status": "success"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "assistantResponseMessage": {
+                            "content": "Recent response"
+                        }
+                    },
+                    {
+                        "userInputMessage": {
+                            "content": "Recent message",
+                            "userInputMessageContext": {}
+                        }
+                    }
+                ]
             }
-        }
+        });
+
+        let mut assistant_only_trimmed = payload.clone();
+        assistant_only_trimmed
+            .pointer_mut("/conversationState/history")
+            .and_then(Value::as_array_mut)
+            .unwrap()
+            .remove(0);
+        let max_bytes = check_payload_size(&assistant_only_trimmed);
+
+        let trimmed = trim_kiro_payload_history(&mut payload, max_bytes);
+
+        assert!(trimmed);
+        let history = payload
+            .pointer("/conversationState/history")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_no_orphaned_tool_results(history);
+        assert_eq!(
+            history[1]
+                .pointer("/userInputMessage/content")
+                .and_then(Value::as_str),
+            Some("Continue")
+        );
     }
 
     #[tokio::test]
@@ -5111,7 +5290,6 @@ mod tests {
             user_agent: "KiroIDE 0.11.34 machine-123".to_string(),
             auth_method: Some("external_idp".to_string()),
             send_opt_out: true,
-            http: reqwest::Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5178,7 +5356,6 @@ mod tests {
             user_agent: "KiroIDE 0.11.34 machine-456".to_string(),
             auth_method: Some("social".to_string()),
             send_opt_out: true,
-            http: reqwest::Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5223,7 +5400,6 @@ mod tests {
             user_agent: "KiroIDE 0.11.34 machine-789".to_string(),
             auth_method: Some("social".to_string()),
             send_opt_out: true,
-            http: reqwest::Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5258,7 +5434,6 @@ mod tests {
             user_agent: "KiroIDE 0.11.34 machine-999".to_string(),
             auth_method: Some("IdC".to_string()),
             send_opt_out: true,
-            http: reqwest::Client::new(),
         };
 
         let request = with_kiro_upstream_headers(
@@ -5294,7 +5469,6 @@ mod tests {
                 user_agent: "KiroIDE 0.11.34 machine-1000".to_string(),
                 auth_method: Some("IdC".to_string()),
                 send_opt_out: true,
-                http: reqwest::Client::new(),
             };
 
             let request = with_kiro_upstream_headers(
